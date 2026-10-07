@@ -210,6 +210,7 @@ async function screenHome() {
       <div><small>Правила</small><b>v${esc(rb.version)}</b></div>
       <div class="${NN ? '' : 'st-warn'}"><small>Нейросеть</small><b>${NN ? `v${esc(NN.meta.version)}` : 'отключена'}</b></div>
       <div><small>Пользователь</small><b>${esc(user.title)}</b></div>
+      ${window.isSecureContext ? '' : '<div class="st-warn" title="Открыто по http: браузер отключает офлайн-запуск и шифрование. Нужен https или localhost."><small>Защита</small><b>Без HTTPS</b></div>'}
     </section>
 
     <section class="kpis" data-tour="kpi">

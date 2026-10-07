@@ -4,6 +4,20 @@
 
 > **HTTPS обязателен.** Без него браузер на телефоне отключает работу офлайн (Service Worker) и шифрование. На `localhost` это не нужно, на домене — нужно.
 
+## Быстрый запуск по HTTP (для демонстрации)
+
+На сервере с Docker:
+```bash
+git clone -b claude/mvp-tech-spec-9jarz9 https://github.com/samplecodeschool-cell/huesos.git && cd huesos
+docker build -t toro-assistant .
+docker run -d --name toro --restart unless-stopped -p 80:8080 -v toro-data:/data -e RULES_SIGNING_KEY=$(openssl rand -hex 32) toro-assistant
+```
+Без Docker (Node.js ≥ 20): `sudo PORT=80 node server/server.js` или `PORT=8080 node server/server.js` с открытием порта 8080 в файрволе.
+
+Откройте `http://IP-сервера/` (или `:8080`).
+
+**Что работает по http:** все экраны, анализ, нейросеть, справочник, обучение, решения и синхронизация с сервером. **Что не работает:** браузер отключает Service Worker и WebCrypto вне https. Поэтому приложение не откроется без сети, а записи на устройстве хранятся без шифрования. На главной в строке состояния показывается «Защита: Без HTTPS». Для показа офлайн-режима нужен https (ниже) или localhost.
+
 ## Вариант А. VPS / облачный сервер (Linux, есть SSH) — рекомендуется
 
 ### A1. Через Docker (проще всего)
