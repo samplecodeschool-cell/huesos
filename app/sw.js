@@ -1,8 +1,8 @@
 // Service Worker: приложение и диагностическое ядро кэшируются на устройстве,
 // поэтому интерфейс открывается и работает без связи. API не кэшируется.
-const CACHE = 'toro-assistant-v5';
+const CACHE = 'toro-assistant-v6';
 const ASSETS = ['/', '/index.html', '/styles.css', '/app.js', '/ui.js', '/db.js', '/sync.js', '/manifest.webmanifest', '/icon.svg',
-  '/core/engine.js', '/core/rules.js', '/core/catalog.js', '/core/demo-data.js', '/core/knowledge.js', '/core/nn.js', '/core/model/nn-model.js'];
+  '/core/engine.js', '/core/rules.js', '/core/catalog.js', '/core/demo-data.js', '/core/knowledge.js', '/core/nn.js', '/core/mtoro.js', '/core/model/nn-model.js'];
 
 self.addEventListener('install', (e) => e.waitUntil(caches.open(CACHE).then((c) => c.addAll(ASSETS)).then(() => self.skipWaiting())));
 self.addEventListener('activate', (e) => e.waitUntil(

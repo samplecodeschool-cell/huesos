@@ -20,3 +20,4 @@ jobs:
           npx playwright install --with-deps chromium
           (npm start &) && sleep 2
           node tests/e2e.mjs
+          node tests/e2e-mtoro.mjs

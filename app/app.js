@@ -10,6 +10,7 @@ import { MACHINES, HISTORY, SCENARIOS } from '/core/demo-data.js';
 import { search as kbSearch, docsForCause } from '/core/knowledge.js';
 import { neuralRanker } from '/core/nn.js';
 import { NN_MODEL } from '/core/model/nn-model.js';
+import { textToSymptoms, parseHandoff, decisionToM2Update, buildReturnUrl } from '/core/mtoro.js';
 import * as db from './db.js';
 import { syncNow, startAutoSync, isOnline } from './sync.js';
 import { esc, gauge, mimic, legend, systemStates, silhouette, stepper, hint, startTour, endTour, TOURS, paramState } from './ui.js';
@@ -128,6 +129,8 @@ async function layout(screen, title, body, { back } = {}) {
 async function route() {
   const [, screen, id] = (location.hash || '#/').split('/');
   try {
+    if (location.hash.startsWith('#/import?')) return await importFromMobileToro(location.hash.slice('#/import?'.length));
+    if (screen === 'take') return await takeFromInbox(decodeURIComponent(id));
     if (!screen) return await screenHome();
     if (screen === 'machine') return await screenMachine(id);
     if (screen === 'defect') return await screenDefect(id);
@@ -178,6 +181,14 @@ async function collectAlarms(machines, defects, analyses) {
     else if (r.status === 'MULTIPLE') alarms.push({ ...base, key: `def:${d.id}:multi`, level: 'warn', prio: 2, text: 'Несколько причин — выполнить проверки', sub: r.causes.slice(0, 2).map((c) => `${c.title} ${pct(c.prob)}`).join(' / '), href: `#/checks/${d.id}` });
     else alarms.push({ ...base, key: `def:${d.id}:clear`, level: 'info', prio: 3, text: `Ожидает решения: ${top}`, sub: 'Причина установлена', href: `#/decision/${d.id}` });
   }
+  const taken = new Set(defects.map((d) => d.m2?.qmnum).filter(Boolean));
+  for (const { m2, suggestedSymptoms } of (await db.getMeta('m2inbox'))?.messages ?? []) {
+    if (taken.has(m2.qmnum)) continue;
+    alarms.push({ key: `m2:${m2.qmnum}`, level: 'warn', prio: 2, machineId: m2.equnr, since: m2.createdAt,
+      text: `Новое М2 №${m2.qmnum}: ${m2.qmtxt}`,
+      sub: `Мобильное ТОРО · ${m2.author}${suggestedSymptoms.length ? ` · ${suggestedSymptoms.map((x) => SYMPTOMS[x]).join(', ')}` : ''} · нажмите, чтобы взять в анализ`,
+      href: `#/take/${encodeURIComponent(m2.qmnum)}` });
+  }
   const acks = await db.getMeta('acks', {});
   for (const al of alarms) al.ackAt = acks[al.key] ?? null;
   return alarms.sort((a, b) => a.prio - b.prio || (a.ackAt ? 1 : 0) - (b.ackAt ? 1 : 0));
@@ -201,12 +212,14 @@ async function screenHome() {
   const attention = machines.filter((m) => worstLevel(byMachine[m.id]) === 'warn').length;
   const waiting = defects.filter((d) => d.status !== 'DECIDED').length;
   const unack = alarms.filter((a) => a.level !== 'info' && !a.ackAt).length;
+  const newM2 = alarms.filter((a) => a.key.startsWith('m2:')).length;
 
   await layout('home', 'Обзор', `
     <section class="status-strip" data-tour="status">
       <div class="${online ? '' : 'st-warn'}"><small>Связь</small><b>${online ? 'pLTE, есть' : 'Офлайн'}</b></div>
       <div class="${queue ? 'st-warn' : ''}"><small>Очередь</small><b>${queue} зап.</b></div>
       <div><small>Синхронизация</small><b>${fmtDate(lastSync)}</b></div>
+      <div class="${newM2 ? 'st-warn' : ''}"><small>Мобильное ТОРО</small><b>${newM2 ? `новых М2: ${newM2}` : 'нет новых М2'}</b></div>
       <div><small>Правила</small><b>v${esc(rb.version)}</b></div>
       <div class="${NN ? '' : 'st-warn'}"><small>Нейросеть</small><b>${NN ? `v${esc(NN.meta.version)}` : 'отключена'}</b></div>
       <div><small>Пользователь</small><b>${esc(user.title)}</b></div>
@@ -297,16 +310,47 @@ function telemetryFor(machineId) {
   return Object.fromEntries(Object.entries(s?.params ?? {}).filter(([k]) => PARAMS[k]?.source === 'WENCO'));
 }
 
-async function createDefect(machineId, { symptoms = [], comment = '', params, scenarioId = null } = {}) {
+async function createDefect(machineId, { symptoms = [], comment = '', params, scenarioId = null, m2 = null, ret = null } = {}) {
   const defect = {
-    id: db.uuid(), machineId, symptoms, comment, scenarioId,
+    id: db.uuid(), machineId, symptoms, comment, scenarioId, m2, ret,
     params: params ?? telemetryFor(machineId),
     createdAt: new Date().toISOString(), status: 'OPEN', analyses: [],
   };
   await db.put('defects', defect);
-  await db.log('DEFECT_CREATED', { defectId: defect.id, machineId, scenarioId });
+  await db.log('DEFECT_CREATED', { defectId: defect.id, machineId, scenarioId, qmnum: m2?.qmnum ?? null });
   return defect;
 }
+
+// ---------- Интеграция с «Мобильным ТОРО» ----------
+/** Дефект пришёл ссылкой из «Мобильного ТОРО» на этом же телефоне (работает без сети). */
+async function importFromMobileToro(query) {
+  const h = parseHandoff(query);
+  if (!h) throw new Error('Ссылка из «Мобильного ТОРО» без единицы оборудования');
+  const machine = await db.get('machines', h.m2.equnr);
+  if (!machine) throw new Error(`Оборудование ${h.m2.equnr} не найдено в справочнике ассистента`);
+  const existing = h.m2.qmnum && (await db.all('defects')).find((d) => d.m2?.qmnum === h.m2.qmnum);
+  if (existing) { location.replace(`#/${existing.status === 'DECIDED' ? 'decision' : 'defect'}/${existing.id}`); return; }
+  const d = await createDefect(machine.id, { symptoms: textToSymptoms(`${h.m2.qmtxt} ${h.m2.longText}`), comment: h.m2.qmtxt, m2: h.m2, ret: h.ret });
+  await db.log('M2_IMPORTED', { qmnum: h.m2.qmnum, channel: 'deeplink' });
+  location.replace(`#/defect/${d.id}`);
+}
+
+/** Взять в анализ сообщение М2 из входящих (получено через узел карьера). */
+async function takeFromInbox(qmnum) {
+  const existing = (await db.all('defects')).find((d) => d.m2?.qmnum === qmnum);
+  if (existing) { location.replace(`#/defect/${existing.id}`); return; }
+  const item = ((await db.getMeta('m2inbox'))?.messages ?? []).find((x) => x.m2.qmnum === qmnum);
+  if (!item) throw new Error(`Сообщение М2 ${qmnum} не найдено во входящих`);
+  const machine = await db.get('machines', item.m2.equnr);
+  if (!machine) throw new Error(`Оборудование ${item.m2.equnr} не найдено в справочнике ассистента`);
+  const d = await createDefect(machine.id, { symptoms: item.suggestedSymptoms, comment: item.m2.qmtxt, m2: item.m2 });
+  await db.log('M2_IMPORTED', { qmnum, channel: 'inbox' });
+  location.replace(`#/defect/${d.id}`);
+}
+
+const m2Panel = (m2) => (m2 ? `<section class="panel src-m2"><h3>Из «Мобильного ТОРО» · М2 ${m2.qmnum ? `№${esc(m2.qmnum)}` : '(номер присвоится при синхронизации)'}</h3>
+  <p><b>${esc(m2.qmtxt)}</b>${m2.longText ? `<br>${esc(m2.longText)}` : ''}</p>
+  <small class="muted">${esc(m2.author ?? '')}${m2.createdAt ? ` · ${fmtDate(m2.createdAt)}` : ''}. Симптомы предложены по тексту сообщения — проверьте и дополните.</small></section>` : '');
 
 const machineHead = (m) => `<section class="mhead">${silhouette(MODELS[m.model])}<div><b>${esc(m.id)}</b><span>${esc(m.model)}</span><small>${esc(m.location)}</small></div></section>`;
 
@@ -355,6 +399,7 @@ async function screenDefect(id) {
   await layout('defect', 'Дефект и параметры', `
     ${stepper(2)}
     ${machineHead(m)}
+    ${m2Panel(d.m2)}
     <h2>Что обнаружено ${hint('Отметьте все замеченные признаки. Можно несколько.')}</h2>
     <section data-tour="symptoms">${SYMPTOM_GROUPS.map(([g, list]) => `<div class="sgroup"><small>${esc(g)}</small><div class="chips">
       ${list.map((k) => `<button class="chip ${d.symptoms.includes(k) ? 'on' : ''}" data-sym="${k}">${esc(SYMPTOMS[k])}</button>`).join('')}</div></div>`).join('')}
@@ -539,6 +584,7 @@ async function screenDecision(id) {
   await layout('decision', 'Решение', `
     ${stepper(5, decided ? 5 : 4)}
     ${banner(r)}
+    ${d.m2 ? `<p class="sub">Источник: «Мобильное ТОРО», М2 ${d.m2.qmnum ? `№${esc(d.m2.qmnum)}` : ''} — «${esc(d.m2.qmtxt)}». Результат будет дописан в это сообщение.</p>` : ''}
     ${decided ? `<section class="panel ok" data-tour="decide"><h3>✓ Решение принято</h3>
         <div class="kv"><span>Решение</span><b>${esc(decided.title)}</b></div>
         <div class="kv"><span>Причина</span><b>${esc(CAUSES[decided.cause]?.title ?? 'не установлена')}</b></div>
@@ -562,13 +608,14 @@ async function screenDecision(id) {
       <div class="syncflow">
         <div class="sf ${decided ? 'done' : 'idle'}"><i>📱</i><span>Сохранено на устройстве</span><small>${decided ? 'зашифровано' : 'ожидает решения'}</small></div>
         <div class="sf ${decided && !inQueue ? 'done' : online ? 'wait' : 'idle'}"><i>📡</i><span>Узел карьера</span><small>${decided ? (inQueue ? (online ? 'отправка…' : 'ждёт связи') : 'доставлено') : '—'}</small></div>
-        <div class="sf ${decided && !inQueue ? 'done' : 'idle'}"><i>🗂</i><span>Сообщение М2 в ТОРО</span><small>${decided && !inQueue ? 'сформировано' : '—'}</small></div>
+        <div class="sf ${decided && !inQueue ? 'done' : 'idle'}"><i>🗂</i><span>${d.m2?.qmnum ? `М2 №${esc(d.m2.qmnum)}` : 'Сообщение М2'}</span><small>${decided && !inQueue ? (d.m2?.qmnum ? 'дополнено результатом' : 'сформировано') : '—'}</small></div>
       </div>
       <div class="kv"><span>Записей в очереди</span><b>${queue.length}</b></div>
       <div class="kv"><span>Последняя синхронизация</span><b>${fmtDate(lastSync)}</b></div>
       <button class="btn" id="syncBtn">↻ Синхронизировать сейчас</button>
     </section>
-    ${decided ? '<a class="btn primary big" href="#/">К обзору парка</a>' : ''}`,
+    ${decided?.returnUrl ? `<a class="btn primary big" href="${esc(decided.returnUrl)}">← Вернуться в «Мобильное ТОРО»</a>` : ''}
+    ${decided ? `<a class="btn ${decided.returnUrl ? '' : 'primary'} big" href="#/">К обзору парка</a>` : ''}`,
   { back: `#/analysis/${id}` });
 
   $app.querySelectorAll('[data-dec]').forEach((b) => (b.onclick = async () => {
@@ -586,10 +633,12 @@ async function screenDecision(id) {
       decision: opt.id, selectedCause: cause, comment, user: user.id, role: user.role,
       analysisStatus: r.status, rulebaseVersion: r.trace.rulebaseVersion, topCauses: r.causes.slice(0, 3).map((c) => c.id),
       agreesWithAgent: cause ? cause === r.causes[0]?.id : null,
+      m2: d.m2 ? { qmnum: d.m2.qmnum } : null,
     };
     const outboxId = await db.enqueue('DECISION', payload);
     d.decision = { id: opt.id, title: opt.title, cause, userTitle: user.title, at: new Date().toISOString(), outboxId };
     d.status = 'DECIDED';
+    if (d.ret) d.decision.returnUrl = buildReturnUrl(d.ret, decisionToM2Update(payload));
     await db.put('decisions', { id: outboxId, defectId: d.id, sealed: await db.seal(payload) });
     await db.put('defects', d);
     await db.log('DECISION_CONFIRMED', { defectId: d.id, decision: opt.id, status: r.status, agreesWithAgent: payload.agreesWithAgent });

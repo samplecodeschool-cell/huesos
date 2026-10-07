@@ -71,9 +71,21 @@ async function updateRules() {
       await putMany('machines', machines);
       await putMany('history', history);
     }
+    await fetchInbox();
   } catch (e) {
     await log('RULES_UPDATE_FAILED', { error: e.message });
   }
+}
+
+/** Новые сообщения М2 из «Мобильного ТОРО» (через узел карьера). Хранятся локально — видны и без связи. */
+async function fetchInbox() {
+  const r = await fetch('/api/inbox', { headers: { 'x-device-token': TOKEN } });
+  if (!r.ok) return;
+  const { messages, source } = await r.json();
+  const before = new Set(((await getMeta('m2inbox'))?.messages ?? []).map((x) => x.m2.qmnum));
+  await setMeta('m2inbox', { messages, source, fetchedAt: new Date().toISOString() });
+  const fresh = messages.filter((x) => !before.has(x.m2.qmnum));
+  if (fresh.length) await log('M2_RECEIVED', { qmnum: fresh.map((x) => x.m2.qmnum), source });
 }
 
 let timer;

@@ -12,6 +12,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { RULEBASE } from '../core/rules.js';
 import { HISTORY, MACHINES } from '../core/demo-data.js';
+import { decisionToM2Update, textToSymptoms } from '../core/mtoro.js';
+import { createMobileToroAdapter } from './mtoro-adapter.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const DATA_DIR = process.env.DATA_DIR ?? path.join(ROOT, 'server', 'data');
@@ -21,7 +23,12 @@ const SIGNING_KEY = process.env.RULES_SIGNING_KEY ?? 'demo-signing-key-change-me
 const DEVICE_TOKENS = new Set((process.env.DEVICE_TOKENS ?? 'demo-device-token').split(','));
 
 const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.json': 'application/json; charset=utf-8', '.webmanifest': 'application/manifest+json', '.svg': 'image/svg+xml', '.png': 'image/png' };
-const STATIC_ROOTS = { '/core/': path.join(ROOT, 'core'), '/': path.join(ROOT, 'app') };
+const STATIC_ROOTS = { '/core/': path.join(ROOT, 'core'), '/mtoro/': path.join(ROOT, 'mtoro'), '/': path.join(ROOT, 'app') };
+
+// «Мобильное ТОРО»: эмулятор доступен всегда (демо), адаптер ассистента — эмулятор или REST-шлюз.
+const EMULATOR_ON = process.env.MTORO_EMULATOR !== 'off';
+const MTORO_EMU = createMobileToroAdapter({ mode: 'emulator', dataDir: () => DATA_DIR });
+const MTORO = process.env.MTORO_MODE === 'rest' ? createMobileToroAdapter({ mode: 'rest' }) : MTORO_EMU;
 
 const storeFile = () => path.join(DATA_DIR, 'store.json');
 const journalFile = () => path.join(DATA_DIR, 'journal.jsonl');
@@ -59,6 +66,21 @@ export function toSapMessage(item) {
   };
 }
 
+/** Дописать результат ассистента в исходное сообщение М2 «Мобильного ТОРО». Ошибка не теряет решение: повтор при следующей синхронизации. */
+async function writeBackM2(stored, deviceId) {
+  const qmnum = stored.payload?.m2?.qmnum;
+  if (stored.type !== 'DECISION' || !qmnum || stored.m2Written) return null;
+  try {
+    await MTORO.appendAssistantResult(qmnum, decisionToM2Update({ ...stored.payload, decidedAt: stored.createdAt }));
+    stored.m2Written = new Date().toISOString();
+    await appendFile(journalFile(), JSON.stringify({ ts: stored.m2Written, event: 'M2_UPDATED', deviceId, qmnum, itemId: stored.id }) + '\n');
+    return 'updated';
+  } catch (e) {
+    await appendFile(journalFile(), JSON.stringify({ ts: new Date().toISOString(), event: 'M2_UPDATE_FAILED', deviceId, qmnum, error: e.message }) + '\n');
+    return 'pending';
+  }
+}
+
 export async function handleSync(body) {
   if (!body || !Array.isArray(body.items) || typeof body.deviceId !== 'string') {
     return [400, { error: 'Ожидается {deviceId, items[]}' }];
@@ -71,11 +93,16 @@ export async function handleSync(body) {
       if (!item?.id || !item.type) { acks.push({ id: item?.id ?? null, ok: false, error: 'нет id/type' }); continue; }
       const hash = createHash('sha256').update(JSON.stringify(item.payload ?? null)).digest('hex');
       if (item.hash && item.hash !== hash) { acks.push({ id: item.id, ok: false, error: 'контрольная сумма не совпала' }); continue; }
-      if (store.items[item.id]) { acks.push({ id: item.id, ok: true, duplicate: true }); continue; }
-      store.items[item.id] = { ...item, hash, deviceId: body.deviceId, receivedAt: new Date().toISOString() };
+      if (store.items[item.id]) {
+        const m2 = await writeBackM2(store.items[item.id], body.deviceId); // повтор, если в прошлый раз М2 не обновилось
+        acks.push({ id: item.id, ok: true, duplicate: true, ...(m2 ? { m2 } : {}) });
+        continue;
+      }
+      const stored = (store.items[item.id] = { ...item, hash, deviceId: body.deviceId, receivedAt: new Date().toISOString() });
       await appendFile(journalFile(), JSON.stringify({ ts: new Date().toISOString(), event: 'SYNC_RECEIVED', deviceId: body.deviceId, itemId: item.id, type: item.type }) + '\n');
       if (item.type === 'DECISION') await appendFile(sapOutboxFile(), JSON.stringify(toSapMessage(item)) + '\n');
-      acks.push({ id: item.id, ok: true });
+      const m2 = await writeBackM2(stored, body.deviceId);
+      acks.push({ id: item.id, ok: true, ...(m2 ? { m2 } : {}) });
     }
     await writeFile(storeFile(), JSON.stringify(store, null, 1));
     return [200, { acks, serverTime: new Date().toISOString(), rulebaseVersion: RULEBASE.version }];
@@ -121,6 +148,21 @@ function send(res, code, obj) {
   res.end(JSON.stringify(obj));
 }
 
+/** API эмулятора «Мобильного ТОРО» (повторяет контракт REST-шлюза, см. docs/integration-mobile-toro.md). */
+async function handleEmulator(req, res, pathname) {
+  const parts = pathname.replace('/mtoro/api/', '').split('/').filter(Boolean).map(decodeURIComponent);
+  if (parts[0] === 'equipment' && req.method === 'GET') return send(res, 200, MACHINES.map(({ id, model, location }) => ({ equnr: id, model, location })));
+  if (parts[0] !== 'messages') return send(res, 404, { error: 'unknown endpoint' });
+  if (parts.length === 1 && req.method === 'GET') return send(res, 200, await MTORO_EMU.list());
+  if (parts.length === 1 && req.method === 'POST') return send(res, 201, await MTORO_EMU.create(await readJson(req, 50_000)));
+  if (parts.length === 2 && req.method === 'GET') {
+    const m = await MTORO_EMU.get(parts[1]);
+    return m ? send(res, 200, m) : send(res, 404, { error: 'not found' });
+  }
+  if (parts.length === 3 && parts[2] === 'assistant' && req.method === 'POST') return send(res, 200, await MTORO_EMU.appendAssistantResult(parts[1], await readJson(req, 50_000)));
+  return send(res, 405, { error: 'method not allowed' });
+}
+
 export function createServer() {
   return http.createServer(async (req, res) => {
     const { pathname } = new URL(req.url, 'http://local');
@@ -130,13 +172,22 @@ export function createServer() {
         if (!authorized(req)) return send(res, 401, { error: 'устройство не авторизовано' });
         if (pathname === '/api/rules' && req.method === 'GET') return send(res, 200, signRulebase(RULEBASE));
         if (pathname === '/api/reference' && req.method === 'GET') return send(res, 200, { machines: MACHINES, history: HISTORY });
+        if (pathname === '/api/inbox' && req.method === 'GET') {
+          const open = await MTORO.listOpen();
+          return send(res, 200, { source: MTORO.mode, messages: open.map((m) => ({ m2: m, suggestedSymptoms: textToSymptoms(`${m.qmtxt} ${m.longText ?? ''}`) })) });
+        }
         if (pathname === '/api/sync' && req.method === 'POST') {
           const [code, body] = await handleSync(await readJson(req));
           return send(res, code, body);
         }
         return send(res, 404, { error: 'unknown endpoint' });
       }
+      if (pathname.startsWith('/mtoro/api/')) {
+        if (!EMULATOR_ON) return send(res, 404, { error: 'эмулятор отключён' });
+        return await handleEmulator(req, res, pathname);
+      }
       if (req.method !== 'GET') return send(res, 405, { error: 'method not allowed' });
+      if (pathname === '/mtoro') { res.writeHead(301, { location: '/mtoro/' }); return res.end(); }
       return serveStatic(req, res, pathname);
     } catch (e) {
       send(res, e.status ?? 500, { error: e.message });

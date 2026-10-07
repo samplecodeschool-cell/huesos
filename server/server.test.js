@@ -56,3 +56,44 @@ test('выход за пределы каталога статики запре�
   const r = await fetch(`${base}/core/..%2F..%2Fpackage.json`);
   assert.notEqual(r.status, 200);
 });
+
+// ---------- Интеграция с «Мобильным ТОРО» ----------
+const post = (url, body, headers = H) => fetch(url, { method: 'POST', headers, body: JSON.stringify(body) }).then((r) => r.json());
+
+test('М2 из «Мобильного ТОРО» → входящие ассистента → решение → результат в М2', async () => {
+  const m2 = await post(`${base}/mtoro/api/messages`, { equnr: 'T-305', qmtxt: 'Слабые тормоза на спуске', author: 'Механик ОТК' }, { 'content-type': 'application/json' });
+  assert.equal(m2.qmart, 'M2');
+  assert.equal(m2.status, 'OPEN');
+
+  const inbox = await (await fetch(`${base}/api/inbox`, { headers: H })).json();
+  const item = inbox.messages.find((x) => x.m2.qmnum === m2.qmnum);
+  assert.ok(item, 'сообщение должно появиться во входящих');
+  assert.deepEqual(item.suggestedSymptoms, ['BRAKE_WEAK']);
+
+  const decision = { id: 'd-m2-1', type: 'DECISION', createdAt: '2026-10-07T10:00:00Z',
+    payload: { machineId: 'T-305', symptoms: ['BRAKE_WEAK'], decision: 'STOP_AND_CALL', selectedCause: 'BRAKE_SEALS', user: 'mech-1042', analysisStatus: 'CRITICAL', rulebaseVersion: '0.3.0-demo', topCauses: ['BRAKE_SEALS'], m2: { qmnum: m2.qmnum } } };
+  const r = await post(`${base}/api/sync`, { deviceId: 'dev-1', items: [decision] });
+  assert.equal(r.acks[0].m2, 'updated');
+
+  const updated = await (await fetch(`${base}/mtoro/api/messages/${m2.qmnum}`)).json();
+  assert.equal(updated.status, 'STOPPED');
+  assert.equal(updated.priority, 1);
+  assert.match(updated.assistant.longText, /КРИТИЧЕСКОЕ/);
+  const inbox2 = await (await fetch(`${base}/api/inbox`, { headers: H })).json();
+  assert.ok(!inbox2.messages.some((x) => x.m2.qmnum === m2.qmnum), 'обработанное М2 уходит из входящих');
+});
+
+test('входящие М2 требуют токен устройства; эмулятор проверяет обязательные поля', async () => {
+  assert.equal((await fetch(`${base}/api/inbox`)).status, 401);
+  const r = await fetch(`${base}/mtoro/api/messages`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{"equnr":"T-1"}' });
+  assert.equal(r.status, 400);
+});
+
+test('REST-адаптер работает по тому же контракту (проверка на эмуляторе)', async () => {
+  const { createMobileToroAdapter } = await import('./mtoro-adapter.js');
+  const rest = createMobileToroAdapter({ mode: 'rest', url: `${base}/mtoro/api` });
+  const m = await rest.create({ equnr: 'E-02', qmtxt: 'Медленно поднимается стрела' });
+  assert.ok((await rest.listOpen()).some((x) => x.qmnum === m.qmnum));
+  const res = await rest.appendAssistantResult(m.qmnum, { priority: 3, breakdown: false, longText: 'ok' });
+  assert.equal(res.status, 'ANALYZED');
+});

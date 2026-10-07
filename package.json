@@ -6,7 +6,7 @@
   "description": "ТОРО-Ассистент: офлайн ИИ-агент поддержки решений при диагностике самоходной горной техники (MVP)",
   "scripts": {
     "test": "node --test",
-    "e2e": "node tests/e2e.mjs",
+    "e2e": "node tests/e2e.mjs && node tests/e2e-mtoro.mjs",
     "start": "node server/server.js",
     "demo": "node tools/run-scenarios.js",
     "train": "node tools/train-nn.js"
