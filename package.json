@@ -8,7 +8,8 @@
     "test": "node --test",
     "e2e": "node tests/e2e.mjs",
     "start": "node server/server.js",
-    "demo": "node tools/run-scenarios.js"
+    "demo": "node tools/run-scenarios.js",
+    "train": "node tools/train-nn.js"
   },
   "engines": { "node": ">=20" }
 }

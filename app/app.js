@@ -8,6 +8,8 @@ import { RULEBASE } from '/core/rules.js';
 import { PARAMS, SYMPTOMS, MODELS, PROFILES, CAUSES, ELECTRIC_DRIVE } from '/core/catalog.js';
 import { MACHINES, HISTORY, SCENARIOS } from '/core/demo-data.js';
 import { search as kbSearch, docsForCause } from '/core/knowledge.js';
+import { neuralRanker } from '/core/nn.js';
+import { NN_MODEL } from '/core/model/nn-model.js';
 import * as db from './db.js';
 import { syncNow, startAutoSync, isOnline } from './sync.js';
 import { esc, gauge, mimic, legend, systemStates, silhouette, stepper, hint, startTour, endTour, TOURS, paramState } from './ui.js';
@@ -17,7 +19,7 @@ const USERS = [
   { id: 'smech-0311', title: 'Старший механик (таб. 0311)', role: 'SENIOR_MECHANIC' },
 ];
 const STATUS_UI = {
-  CLEAR: { cls: 'ok', label: 'Однозначная причина', icon: '✓' },
+  CLEAR: { cls: 'ok', label: 'Однозначная причина', icon: '1' },
   MULTIPLE: { cls: 'warn', label: 'Несколько вероятных причин', icon: '≈' },
   INSUFFICIENT: { cls: 'info', label: 'Данных недостаточно', icon: '?' },
   CRITICAL: { cls: 'crit', label: 'Критическое состояние', icon: '!' },
@@ -141,59 +143,145 @@ async function route() {
   }
 }
 
-async function machineState(m, defects, analyses) {
-  const open = defects.filter((d) => d.machineId === m.id && d.status !== 'DECIDED');
-  let st = open.length ? 'warn' : 'ok';
-  for (const d of open) {
+// ---------- Сигналы (аварийно-предупредительная сигнализация) ----------
+// Приоритет 1 — критично, 2 — требует действия, 3 — к сведению. Новые сигналы мигают до квитирования.
+const NN = neuralRanker(NN_MODEL);
+const FLEET_COLS = [
+  ['coolantTemp', 'ОЖ', '°C'], ['hydraulicPressure', 'Гидр.', 'МПа'], ['tirePressure', 'Шины', 'бар'],
+];
+
+async function collectAlarms(machines, defects, analyses) {
+  const alarms = [];
+  for (const m of machines) {
+    const lim = limitsOf(m);
+    for (const [k, v] of Object.entries(telemetryFor(m.id))) {
+      const st = paramState(k, v, lim[k]);
+      if (st === 'warn' || st === 'crit') {
+        alarms.push({ key: `tele:${m.id}:${k}`, level: st, prio: st === 'crit' ? 1 : 2, machineId: m.id,
+          text: `${PARAMS[k].label}: ${v} ${PARAMS[k].unit}`, sub: 'Отклонение по данным диспетчерской системы', href: `#/machine/${m.id}` });
+      }
+    }
+    const toTO = m.nextServiceAt - m.engineHours;
+    if (toTO <= 150) {
+      alarms.push({ key: `to:${m.id}:${m.nextServiceAt}`, level: 'info', prio: 3, machineId: m.id,
+        text: `До ${m.serviceType}: ${toTO} м·ч`, sub: 'Совместить устранение дефектов с плановым ТО', href: `#/machine/${m.id}` });
+    }
+  }
+  for (const d of defects.filter((x) => x.status !== 'DECIDED')) {
     const a = analyses.find((x) => x.id === d.analyses.at(-1));
-    if (a?.result.status === 'CRITICAL') st = 'crit';
+    const r = a?.result;
+    const top = r?.causes[0]?.title;
+    const base = { machineId: d.machineId, since: d.createdAt };
+    if (!r) alarms.push({ ...base, key: `def:${d.id}:new`, level: 'info', prio: 3, text: 'Дефект зарегистрирован, анализ не выполнен', sub: d.symptoms.map((s) => SYMPTOMS[s]).join(', '), href: `#/defect/${d.id}` });
+    else if (r.status === 'CRITICAL') alarms.push({ ...base, key: `def:${d.id}:crit`, level: 'crit', prio: 1, text: 'Эксплуатация запрещена до решения ответственного лица', sub: r.critical.map((c) => c.reason).join('; '), href: `#/decision/${d.id}` });
+    else if (r.status === 'INSUFFICIENT') alarms.push({ ...base, key: `def:${d.id}:insuf`, level: 'warn', prio: 2, text: `Нужны замеры: ${r.checks.length}`, sub: r.checks.map((c) => c.title).slice(0, 2).join('; '), href: `#/checks/${d.id}` });
+    else if (r.status === 'MULTIPLE') alarms.push({ ...base, key: `def:${d.id}:multi`, level: 'warn', prio: 2, text: 'Несколько причин — выполнить проверки', sub: r.causes.slice(0, 2).map((c) => `${c.title} ${pct(c.prob)}`).join(' / '), href: `#/checks/${d.id}` });
+    else alarms.push({ ...base, key: `def:${d.id}:clear`, level: 'info', prio: 3, text: `Ожидает решения: ${top}`, sub: 'Причина установлена', href: `#/decision/${d.id}` });
   }
-  for (const [k, v] of Object.entries(telemetryFor(m.id))) {
-    const ps = paramState(k, v, limitsOf(m)[k]);
-    if (ps === 'crit') st = 'crit';
-    else if (ps === 'warn' && st === 'ok') st = 'warn';
-  }
-  return { st, open: open.length };
+  const acks = await db.getMeta('acks', {});
+  for (const al of alarms) al.ackAt = acks[al.key] ?? null;
+  return alarms.sort((a, b) => a.prio - b.prio || (a.ackAt ? 1 : 0) - (b.ackAt ? 1 : 0));
 }
 
-// ---------- Обзор парка (диспетчерская панель) ----------
+const worstLevel = (list) => (list.some((a) => a.level === 'crit') ? 'crit' : list.some((a) => a.level === 'warn') ? 'warn' : list.some((a) => a.level === 'info') ? 'info' : 'ok');
+
+// ---------- Обзор: всё для отслеживания на одном экране ----------
 async function screenHome() {
   const machines = await db.all('machines');
   const defects = await db.all('defects');
   const analyses = await db.all('analyses');
+  const alarms = await collectAlarms(machines, defects, analyses);
   const user = await currentUser();
-  const states = await Promise.all(machines.map((m) => machineState(m, defects, analyses)));
-  const cnt = (s) => states.filter((x) => x.st === s).length;
-  await layout('home', 'Обзор парка', `
+  const rb = await rulebase();
+  const queue = (await db.all('outbox')).length;
+  const online = await isOnline();
+  const lastSync = await db.getMeta('lastSync');
+  const byMachine = Object.fromEntries(machines.map((m) => [m.id, alarms.filter((a) => a.machineId === m.id)]));
+  const crit = machines.filter((m) => worstLevel(byMachine[m.id]) === 'crit').length;
+  const attention = machines.filter((m) => worstLevel(byMachine[m.id]) === 'warn').length;
+  const waiting = defects.filter((d) => d.status !== 'DECIDED').length;
+  const unack = alarms.filter((a) => a.level !== 'info' && !a.ackAt).length;
+
+  await layout('home', 'Обзор', `
+    <section class="status-strip" data-tour="status">
+      <div class="${online ? '' : 'st-warn'}"><small>Связь</small><b>${online ? 'pLTE, есть' : 'Офлайн'}</b></div>
+      <div class="${queue ? 'st-warn' : ''}"><small>Очередь</small><b>${queue} зап.</b></div>
+      <div><small>Синхронизация</small><b>${fmtDate(lastSync)}</b></div>
+      <div><small>Правила</small><b>v${esc(rb.version)}</b></div>
+      <div class="${NN ? '' : 'st-warn'}"><small>Нейросеть</small><b>${NN ? `v${esc(NN.meta.version)}` : 'отключена'}</b></div>
+      <div><small>Пользователь</small><b>${esc(user.title)}</b></div>
+    </section>
+
     <section class="kpis" data-tour="kpi">
-      <div class="kpi"><i class="lamp l-ok"></i><b>${cnt('ok')}</b><span>в норме</span></div>
-      <div class="kpi"><i class="lamp l-warn"></i><b>${cnt('warn')}</b><span>с дефектом</span></div>
-      <div class="kpi"><i class="lamp l-crit"></i><b>${cnt('crit')}</b><span>авария</span></div>
+      <div class="kpi"><b>${machines.length}</b><span>машин</span></div>
+      <div class="kpi ${crit ? 'st-crit' : ''}"><b>${crit}</b><span>критично</span></div>
+      <div class="kpi ${attention ? 'st-warn' : ''}"><b>${attention}</b><span>требуют внимания</span></div>
+      <div class="kpi"><b>${waiting}</b><span>ждут решения</span></div>
     </section>
-    <h2>Машины ${hint('Плитка = машина. Лампа в углу — общее состояние. Нажмите, чтобы открыть карточку.')}</h2>
-    <section class="tiles" data-tour="fleet">${machines.map((m, i) => `
-      <a class="tile st-${states[i].st}" href="#/machine/${m.id}">
-        <i class="lamp l-${states[i].st}"></i>
-        ${silhouette(MODELS[m.model])}
-        <b>${esc(m.id)}</b><span>${esc(m.model)}</span>
-        <small>${esc(m.location)}</small>
-        ${states[i].open ? `<em>${states[i].open} дефект</em>` : ''}
-      </a>`).join('')}
+
+    <h2>Активные сигналы · ${alarms.length}${unack ? ` · не квитировано ${unack}` : ''} ${hint('Сверху — самое важное. Мигающая полоса — новый сигнал: нажмите «Квитировать», чтобы подтвердить, что вы его видели. Нажмите на текст сигнала, чтобы перейти к машине или дефекту.')}</h2>
+    <section class="alarms" data-tour="alarms">${alarms.map((a) => `
+      <div class="alarm ${a.level} ${!a.ackAt && a.level !== 'info' ? 'unack' : ''}">
+        <span class="sev"></span>
+        <a class="body" href="${a.href}"><b>${esc(a.machineId)}</b>${esc(a.text)}<small>${esc(a.sub ?? '')}${a.since ? ` · ${fmtDate(a.since)}` : ''}</small></a>
+        ${a.level === 'info' ? '' : a.ackAt ? `<span class="acked">квит. ${fmtDate(a.ackAt)}</span>` : `<button class="ack" data-ack="${esc(a.key)}">Квитировать</button>`}
+      </div>`).join('') || '<div class="empty">Активных сигналов нет. Все машины в норме.</div>'}
     </section>
-    <h2>Учебные сценарии ${hint('Готовые ситуации для демонстрации и тренировки персонала. Каждый сценарий создаёт дефект с заполненными данными.')}</h2>
-    <section class="scen" data-tour="scen">${SCENARIOS.map((s) => `
-      <button class="scen-btn" data-scen="${s.id}"><b>${s.id}</b><span>${esc(s.title)}</span><small>${esc(s.note)}</small></button>`).join('')}
+
+    <h2>Состояние парка ${hint('Значения в норме — обычным шрифтом. Цветом выделено только то, что вышло за порог. «—» — параметр не контролируется для этой техники.')}</h2>
+    <section class="fleet" data-tour="fleet">
+      ${machines.map((m) => {
+        const lim = limitsOf(m);
+        const tele = telemetryFor(m.id);
+        const lvl = worstLevel(byMachine[m.id]);
+        const toTO = m.nextServiceAt - m.engineHours;
+        const open = defects.filter((d) => d.machineId === m.id && d.status !== 'DECIDED');
+        const defLvl = worstLevel(byMachine[m.id].filter((a) => a.key.startsWith('def:')));
+        return `<a class="frow" href="#/machine/${m.id}">
+          <i class="lamp l-${lvl === 'info' ? 'ok' : lvl} ${lvl === 'crit' && byMachine[m.id].some((a) => a.level === 'crit' && !a.ackAt) ? 'blink' : ''}"></i>
+          <span class="id"><b>${esc(m.id)}</b><small>${esc(m.model)}</small></span>
+          <div class="vals">
+            ${fleetCols(m, lim, tele)}
+            <span class="val ${toTO <= 150 ? 'st-info' : ''}">${toTO}<small>до ТО, м·ч</small></span>
+            <span class="val ${open.length ? `st-${defLvl === 'ok' ? 'info' : defLvl}` : 'na'}">${open.length || '—'}<small>дефекты</small></span>
+          </div></a>`;
+      }).join('')}
     </section>
-    <a class="btn" href="#/kb" data-tour="kb">📘 Справочник по технической документации</a>
-    <section class="panel">
-      <label class="lbl">Пользователь устройства ${hint('В промышленной версии — вход по служебной карте/ПИН. Роль определяет права: допуск машины в критическом состоянии — только у старшего механика.')}</label>
+
+    <a class="btn" href="#/kb" data-tour="kb">Справочник по технической документации</a>
+
+    <details class="demo"><summary>Демо-сценарии и настройки</summary>
+      <section class="scen" data-tour="scen">${SCENARIOS.map((s) => `
+        <button class="scen-btn" data-scen="${s.id}"><b>${s.id}</b><span>${esc(s.title)}</span><small>${esc(s.note)}</small></button>`).join('')}
+      </section>
+      <label class="lbl">Пользователь устройства ${hint('В промышленной версии — вход по служебной карте/ПИН. Допуск машины в критическом состоянии — только у старшего механика.')}</label>
       <select id="user" class="big">${USERS.map((u) => `<option value="${u.id}" ${u.id === user.id ? 'selected' : ''}>${esc(u.title)}</option>`).join('')}</select>
-    </section>`);
+      <a class="btn ghost" href="#/sync">Связь, журнал событий, версии</a>
+    </details>`);
   document.getElementById('user').onchange = async (e) => {
     await db.setMeta('user', e.target.value);
     await db.log('USER_SWITCHED', { to: e.target.value });
+    route();
   };
   $app.querySelectorAll('[data-scen]').forEach((b) => (b.onclick = () => startScenario(b.dataset.scen)));
+  $app.querySelectorAll('[data-ack]').forEach((b) => (b.onclick = async () => {
+    const acks = await db.getMeta('acks', {});
+    acks[b.dataset.ack] = new Date().toISOString();
+    await db.setMeta('acks', acks);
+    await db.log('ALARM_ACKNOWLEDGED', { key: b.dataset.ack });
+    route();
+  }));
+}
+
+function fleetCols(m, lim, tele) {
+  return FLEET_COLS.map(([k, l, u]) => {
+    const cap = `<small>${l}, ${u}</small>`;
+    if (!lim[k]) return `<span class="val na">—${cap}</span>`;
+    const v = tele[k];
+    if (v === undefined) return `<span class="val na">н/д${cap}</span>`;
+    const st = paramState(k, v, lim[k]);
+    return `<span class="val ${st === 'warn' || st === 'crit' ? `st-${st}` : ''}">${v}${cap}</span>`;
+  }).join('');
 }
 
 async function startScenario(id) {
@@ -236,7 +324,7 @@ async function screenMachine(id) {
     <section class="panel passport" data-tour="passport">
       <div class="cell"><small>Наработка ДВС</small><b>${m.engineHours.toLocaleString('ru-RU')}</b><span>м·ч</span></div>
       ${m.mileage ? `<div class="cell"><small>Пробег</small><b>${m.mileage.toLocaleString('ru-RU')}</b><span>км</span></div>` : ''}
-      <div class="cell ${toService <= 150 ? 'st-warn' : ''}"><small>До ${esc(m.serviceType)}</small><b>${toService}</b><span>м·ч</span></div>
+      <div class="cell ${toService <= 150 ? 'st-info' : ''}"><small>До ${esc(m.serviceType)}</small><b>${toService}</b><span>м·ч</span></div>
     </section>
     <section class="panel" data-tour="mimic"><h3>Мнемосхема систем ${hint('Цвет блока — состояние системы по последним параметрам.')}</h3>
       ${mimic(systemStates(tele, lim), { electric: ELECTRIC_DRIVE.has(m.model) })}${legend()}</section>
@@ -341,7 +429,7 @@ async function runAnalysis(d) {
   const m = await db.get('machines', d.machineId);
   const history = await db.all('history');
   const rb = await rulebase();
-  const result = analyze({ machine: m, defect: d, params: d.params, history, rulebase: rb });
+  const result = analyze({ machine: m, defect: d, params: d.params, history, rulebase: rb }, NN);
   const a = { id: db.uuid(), defectId: d.id, createdAt: new Date().toISOString(), params: { ...d.params }, symptoms: [...d.symptoms], result };
   await db.put('analyses', a);
   d.analyses.push(a.id);
@@ -369,16 +457,16 @@ async function screenAnalysis(id) {
   await layout('analysis', 'Результат анализа', `
     ${stepper(3)}
     ${banner(r)}
-    ${r.serviceHint ? `<div class="panel info">🛠 ${esc(r.serviceHint)}</div>` : ''}
+    ${r.serviceHint ? `<div class="panel info">${esc(r.serviceHint)}</div>` : ''}
     ${r.warnings.map((w) => `<div class="panel warn">${esc(w)}</div>`).join('')}
     <section class="panel" data-tour="mimic"><h3>Где искать причину</h3>${mimic(systemStates(a.params, limitsOf(m), r), { electric: ELECTRIC_DRIVE.has(m.model) })}${legend()}</section>
     <h2>Возможные причины ${hint('Нажмите на причину, чтобы увидеть доказательства и типовое действие.')}</h2>
-    <section data-tour="causes">${r.causes.slice(0, 5).map((c, i) => `<details class="cause ${i === 0 ? 'top' : ''}"><summary>
+    <section data-tour="causes">${r.causes.slice(0, 5).map((c, i) => `<details class="cause ${i === 0 ? 'lead' : ''}"><summary>
         <span class="ct">${esc(c.title)}<small>${esc(c.system)}</small></span><b>${pct(c.prob)}</b>
         <span class="bar"><i style="width:${pct(c.prob)}"></i></span></summary>
         <ul>${c.evidence.map((e) => `<li>${esc(e)}</li>`).join('')}</ul>
         <p class="act">Действие: <b>${esc(CAUSES[c.id].action)}</b><br>Место: ${esc(CAUSES[c.id].place)} · ориентировочно ${CAUSES[c.id].repairH} ч</p>
-        ${docsForCause(c.id).map((k) => `<div class="kbref"><b>📘 ${esc(k.title)}</b><small>${esc(k.source)}</small><p>${esc(k.text)}</p></div>`).join('')}
+        ${docsForCause(c.id).map((k) => `<div class="kbref"><b>${esc(k.title)}</b><small>${esc(k.source)}</small><p>${esc(k.text)}</p></div>`).join('')}
       </details>`).join('') || '<p class="muted">Гипотез пока нет — нужны данные.</p>'}</section>
     <details class="panel trace" data-tour="trace"><summary>Почему так решено (на основании каких данных)</summary>
       <p><b>Симптомы:</b> ${r.trace.symptoms.map(esc).join(', ') || '—'}</p>
@@ -387,6 +475,9 @@ async function screenAnalysis(id) {
       <p><b>Ожидают замера:</b> ${r.trace.pendingRules.map((p) => p.ruleId).join(', ') || '—'}</p>
       <p><b>Похожие случаи:</b> ${r.trace.similarCases.map((c) => `${c.id} (${c.machineId}, ${esc(CAUSES[c.cause].title)}, сходство ${c.sim})`).join('; ') || '—'}</p>
       <p><b>База правил:</b> v${esc(r.trace.rulebaseVersion)} · движок ${esc(r.trace.engine)} · сила доказательств ${r.trace.evidenceStrength}</p>
+      ${r.trace.ml ? `<p><b>Нейросеть:</b> ${esc(r.trace.ml.name)} v${esc(r.trace.ml.version)} · ${r.trace.ml.params} параметров · вывод ${r.trace.ml.inferenceMs} мс на устройстве ·
+        оценка: ${r.trace.ml.top.map(([c, p]) => `${esc(CAUSES[c].title)} ${pct(p)}`).join('; ')}.
+        <br><small>Нейросеть влияет только на порядок причин. Статусы «критично» и «данных недостаточно» определяют проверяемые правила.</small></p>` : ''}
       <p><small>Анализ №${d.analyses.length} от ${fmtDate(a.createdAt)}. Выполнен на устройстве, без сети.</small></p>
     </details>
     <div class="actions" data-tour="next">
@@ -517,7 +608,7 @@ async function screenKb(q = '') {
       <button class="btn primary">Найти</button></form>
     <div class="chips" style="margin-top:12px">${['течь РВД', 'давление в шине', 'перегрев ОЖ', 'срабатывание защиты', 'тормоза'].map((t) => `<a class="chip" href="#/kb/${encodeURIComponent(t)}">${esc(t)}</a>`).join('')}</div>
     ${query ? `<h2>Найдено: ${res.length}</h2>` : ''}
-    ${res.map((d) => `<section class="panel kbref"><b>📘 ${esc(d.title)}</b><small>${esc(d.source)} · релевантность ${d.score}</small><p>${esc(d.text)}</p>
+    ${res.map((d) => `<section class="panel kbref"><b>${esc(d.title)}</b><small>${esc(d.source)} · релевантность ${d.score}</small><p>${esc(d.text)}</p>
       <small class="muted">Связано с: ${d.causes.map((c) => esc(CAUSES[c].title)).join('; ')}</small></section>`).join('')}
     ${query && !res.length ? '<p class="muted">Ничего не найдено — попробуйте другие слова.</p>' : ''}`,
   { back: '#/' });

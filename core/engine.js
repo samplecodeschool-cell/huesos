@@ -147,7 +147,8 @@ export function analyze({ machine, defect, params, history = [], rulebase }, mlR
 
   if (mlRanker) {
     const ml = mlRanker({ machine, defect, params: clean }) ?? {};
-    for (const [cid, p] of Object.entries(ml)) if (CAUSES[cid] && causeApplicable(cid, machine.model)) add(cid, p, `ML-модель: ${(p * 100).toFixed(0)}%`);
+    const raw = mlRanker.lastRaw ?? ml;
+    for (const [cid, p] of Object.entries(ml)) if (CAUSES[cid] && causeApplicable(cid, machine.model)) add(cid, p, `Нейросеть${mlRanker.meta ? ` v${mlRanker.meta.version}` : ''}: ${((raw[cid] ?? p) * 100).toFixed(0)}%`);
   }
 
   // Ранжирование (softmax по баллам)
@@ -191,6 +192,7 @@ export function analyze({ machine, defect, params, history = [], rulebase }, mlR
       symptoms: [...ctx.symptoms].map((s) => SYMPTOMS[s] ?? s),
       evidenceStrength: +strength.toFixed(2),
       engine: 'rules+cbr' + (mlRanker ? '+ml' : ''),
+      ml: mlRanker?.meta ? { ...mlRanker.meta, inferenceMs: +(mlRanker.lastMs ?? 0).toFixed(2), top: Object.entries(mlRanker.lastRaw ?? {}).slice(0, 3) } : null,
     },
   };
 }

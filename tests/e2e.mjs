@@ -9,6 +9,12 @@ const p = await ctx.newPage();
 const errors = [];
 p.on('pageerror', (e) => errors.push('pageerror: ' + e.message));
 p.on('console', (m) => m.type() === 'error' && errors.push('console: ' + m.text()));
+const openScenario = async (id) => {
+  // раздел демо свёрнут, а главная может перерисоваться — дожидаемся кнопки и нажимаем её из страницы
+  await p.waitForSelector(`[data-scen="${id}"]`, { state: 'attached' });
+  await p.waitForTimeout(300);
+  await p.evaluate((sid) => { document.querySelector('details.demo').open = true; document.querySelector(`[data-scen="${sid}"]`).click(); }, id);
+};
 const shot = async (n, full = true) => { await p.waitForTimeout(400); if (OUT) await p.screenshot({ path: `${OUT}/${n}.png`, fullPage: full }); };
 await p.goto(`${BASE}/`);
 await p.waitForSelector('.modal');
@@ -19,12 +25,11 @@ await shot('01-tour-home', false);
 await p.click('[data-t="next"]'); await p.click('[data-t="next"]');
 await shot('02-tour-kpi', false);
 await p.click('[data-t="off"]');
-await p.waitForSelector('.tiles');
+await p.waitForSelector('.fleet');
 await shot('03-home');
 for (const id of ['S1','S2','S3','S4']) {
   await p.goto(`${BASE}/#/`);
-  await p.waitForSelector(`[data-scen="${id}"]`);
-  await p.click(`[data-scen="${id}"]`);
+  await openScenario(id);
   await p.waitForSelector('#run');
   if (id === 'S1') await shot('10-defect-S1');
   await p.click('#run');
@@ -57,8 +62,15 @@ for (const id of ['S1','S2','S3','S4']) {
   if (id === 'S1') await shot('41-decision-done-S1');
 }
 await p.click('a[href="#/"]');
-await p.waitForSelector('.tiles');
+await p.waitForSelector('.fleet');
 await shot('50-home-after');
+const unack = await p.$$eval('.alarm.unack', (els) => els.length);
+await p.click('[data-ack]');
+await p.waitForFunction((n) => document.querySelectorAll('.alarm.unack').length === n - 1, unack, { timeout: 3000 }).catch(() => {});
+const unack2 = await p.$$eval('.alarm.unack', (els) => els.length);
+console.log('ack:', unack, '→', unack2);
+if (unack2 !== unack - 1) errors.push('квитирование не сработало');
+await shot('51-home-acked');
 await p.goto(`${BASE}/#/machine/T-305`);
 await p.waitForSelector('.mimic');
 await shot('60-machine-T305');
@@ -69,8 +81,8 @@ await shot('70-sync');
 await p.click('#offline');
 await ctx.setOffline(true);
 await p.goto(`${BASE}/#/`);
-await p.waitForSelector('.tiles', { timeout: 5000 }).then(() => console.log('offline reload OK')).catch((e) => console.log('offline reload FAIL', e.message));
-await p.click('[data-scen="S1"]'); await p.waitForSelector('#run'); await p.click('#run'); await p.waitForSelector('.banner');
+await p.waitForSelector('.fleet', { timeout: 5000 }).then(() => console.log('offline reload OK')).catch((e) => console.log('offline reload FAIL', e.message));
+await openScenario('S1'); await p.waitForSelector('#run'); await p.click('#run'); await p.waitForSelector('.banner');
 await p.click('a[href^="#/decision/"]'); await p.waitForSelector('[data-dec]'); await p.click('[data-dec="REPAIR_ON_SITE"]');
 await p.waitForSelector('.panel.ok'); await p.waitForTimeout(500);
 await shot('80-offline-decision');
