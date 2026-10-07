@@ -1,0 +1,14 @@
+{
+  "name": "toro-assistant-mvp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "ТОРО-Ассистент: офлайн ИИ-агент поддержки решений при диагностике самоходной горной техники (MVP)",
+  "scripts": {
+    "test": "node --test",
+    "e2e": "node tests/e2e.mjs",
+    "start": "node server/server.js",
+    "demo": "node tools/run-scenarios.js"
+  },
+  "engines": { "node": ">=20" }
+}

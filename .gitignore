@@ -1,0 +1,9 @@
+node_modules/
+server/data/
+templates/*.local.json
+private/
+*.png
+!docs/screenshots/*.png
+!app/*.png
+.DS_Store
+__pycache__/

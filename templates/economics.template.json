@@ -1,0 +1,12 @@
+{
+  "_comment": "Шаблон без исходных значений. Заполняет экономический блок команды из официальных данных кейса. Не коммитить заполненный файл в публичный репозиторий — сохраняйте как economics.local.json (в .gitignore).",
+  "currency": "",
+  "machines": [
+    { "group": "", "units": null, "events_per_year": null, "delta_t_hours_per_event": null, "downtime_cost_per_hour": null }
+  ],
+  "labor_effect_per_year": null,
+  "repeat_diagnostics_effect_per_year": null,
+  "capex": null,
+  "opex_per_year": null,
+  "max_payback_years": 5
+}

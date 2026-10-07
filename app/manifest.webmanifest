@@ -1,0 +1,12 @@
+{
+  "name": "ТОРО-Ассистент",
+  "short_name": "ТОРО-Ассистент",
+  "description": "Офлайн-помощник механика при диагностике самоходной горной техники",
+  "start_url": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#0b1118",
+  "theme_color": "#0b1118",
+  "lang": "ru",
+  "icons": [{ "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }]
+}
