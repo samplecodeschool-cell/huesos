@@ -1,0 +1,12 @@
+services:
+  toro:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"   # наружу публикует nginx/Caddy с HTTPS
+    environment:
+      RULES_SIGNING_KEY: ${RULES_SIGNING_KEY:-change-me}
+    volumes:
+      - toro-data:/data
+volumes:
+  toro-data:
